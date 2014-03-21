@@ -25,11 +25,6 @@ size_t fileSize(boost::filesystem::path path){
 }
 
 
-/*************************************************************************
- *  SEND FILE TOOLS                                                      *
- *                                                                       *
- *                                                                       *
- *************************************************************************/
 std::string messageHeader(boost::filesystem::path path){
   const size_t file_size  = fileSize(path);
 
@@ -39,7 +34,7 @@ std::string messageHeader(boost::filesystem::path path){
   header << "<path>" << path.parent_path().string() << "</path>" << std::endl;
   header << "<size>" << file_size << "</size>" << std::endl;
   header << "<md5sum>" << "" << "</md5sum>" << std::endl;
-  header << "</transmission>" << std::endl << std::endl;
+  header << "</transmission>" << std::endl;
 
   return header.str();
 }
@@ -64,21 +59,33 @@ std::string messageBody(boost::filesystem::path path){
   return std::string("");
 }
 
-void sendStream(std::istream &stream, tcp::socket &socket, const size_t size){
+
+/*************************************************************************
+ *  SEND FILE TOOLS                                                      *
+ *                                                                       *
+ *                                                                       *
+ *************************************************************************/
+void sendString(tcp::socket &socket, const std::string string){
+  const size_t size = string.size();
+  std::stringstream ss;
+  ss << string;
+
+  sendStream(socket, ss, size);
+}
+
+void sendStream(tcp::socket &socket, std::istream &stream,  const size_t size){
   size_t transferred = 0;
-  const size_t chunk_size = CHUNK_SIZE;
-  boost::array<char, chunk_size> chunk;
+  boost::array<char, CHUNK_SIZE> chunk;
     
   while (transferred != size){ 
       size_t remaining = size - transferred; 
-      size_t write_size = (remaining > chunk_size) ? chunk_size : remaining;
-      stream.read(&chunk[0], chunk_size); 
+      size_t write_size = (remaining > CHUNK_SIZE) ? CHUNK_SIZE : remaining;
+      stream.read(&chunk[0], CHUNK_SIZE); 
       boost::asio::write(socket, boost::asio::buffer(chunk, write_size)); 
       transferred += write_size; 
     } 
 
 }
-
 
 void sendFile(boost::filesystem::path path, std::string host, std::string port){
   // Connect to socket
@@ -93,24 +100,20 @@ void sendFile(boost::filesystem::path path, std::string host, std::string port){
   const std::string header = messageHeader(path); 
   const std::string body   = messageBody(path);
 
-  // Contruct message = header + body
-  std::stringstream message;
-  message << header << body;
-
-  // Send message size
-  uint32_t message_size = header.size() + body.size();
-
   std::cout << "Sending to " 
 	    << socket.remote_endpoint().address() 
 	    << ":" 
 	    << socket.remote_endpoint().port() 
 	    << " " 
-	    << path.filename().string() << std::endl;
+	    << path.filename().string() 
+	    << " (" << body.size() << " Bytes)"<<std::endl;
+  std::cout << header << std::endl;
 
-  boost::asio::write(socket, boost::asio::buffer(&message_size, sizeof(message_size)));
+  // Send header
+  sendString(socket, header);
 
-  // Send message
-  sendStream(message, socket, message_size);
+  // Send body (binary data)
+  sendString(socket, body);
 
 }
 
@@ -119,21 +122,52 @@ void sendFile(boost::filesystem::path path, std::string host, std::string port){
  *                                                                       *
  *                                                                       *
  *************************************************************************/
-std::string recvStream(tcp::socket &socket, const size_t size){
+std::string recvStringUntil(tcp::socket &socket, const std::string delim){
+
+  boost::asio::streambuf streambuf;
   std::stringstream stream;
-  const size_t chunk_size = CHUNK_SIZE;
-  boost::array<char, chunk_size> chunk; 
+
+  boost::asio::read_until(socket, streambuf, delim);
+  std::istream is(&streambuf);
+
+  while(is.good()){
+    std::string string;
+    std::getline(is,string);
+    stream << string << std::endl;
+  }
+
+  return stream.str();
+}
+
+std::string recvString(tcp::socket &socket){
+  std::stringstream stream;
+  boost::array<char, CHUNK_SIZE> buffer; 
+  boost::system::error_code error;
+
+  while(error != boost::asio::error::eof){
+    memset(&buffer, 0, CHUNK_SIZE);
+    size_t size = socket.read_some(boost::asio::buffer(buffer), error);
+    stream.write(buffer.data(), size);
+  }
+  return stream.str();
+
+}
+
+std::string recvString(tcp::socket &socket, const size_t size){
+  std::stringstream stream;
+  boost::array<char, CHUNK_SIZE> chunk; 
   size_t transferred = 0;
     
   while (transferred != size) { 
     size_t remaining = size - transferred; 
-    size_t read_size = (remaining > chunk_size) ? chunk_size : remaining;
+    size_t read_size = (remaining > CHUNK_SIZE) ? CHUNK_SIZE : remaining;
     boost::asio::read(socket, boost::asio::buffer(chunk, read_size)); 
     stream.write(&chunk[0], read_size); 
     transferred += read_size; 
   }
 
   return stream.str();
+
 }
 
 std::tuple<std::string, std::string> recvFile(const unsigned port){
@@ -146,32 +180,28 @@ std::tuple<std::string, std::string> recvFile(const unsigned port){
   tcp::socket socket(io_service); 
   acceptor.accept(socket); 
 
-  uint32_t size  = 0;
-  boost::asio::read(socket, boost::asio::buffer(&size, sizeof(size))); 
+  // Recv header 
+  std::stringstream header; header << recvStringUntil(socket, "</transmission>");
 
-  // Receive message
-  std::string message = recvStream(socket, size);
-
-  // Seperate header(xml) from body
-  std::string endSeq = "</transmission>";
-  std::size_t xmlEndPos = message.find(endSeq) + endSeq.length();
-  std::stringstream header; header << std::string(message.begin(), message.begin() + xmlEndPos);
-  std::string body(message.begin() + xmlEndPos + 2, message.end());
-
-
+  std::cout << header.str() << std::endl;
 
   // Read Xml
   boost::property_tree::ptree ptree;
   read_xml(header, ptree);
 
-  std::string filename = ptree.get<std::string>("transmission.filename");
+  const size_t          size = ptree.get<size_t>("transmission.size");
+  const std::string filename = ptree.get<std::string>("transmission.filename");
+
+  // Receive body (binary data)
+  std::string body = recvString(socket, size);
 
   std::cout << "Receive from " 
 	    << socket.remote_endpoint().address() 
 	    << ":" 
 	    << socket.remote_endpoint().port() 
 	    << " " 
-	    << filename << std::endl;
+	    << filename 
+	    << " (" << body.size() << " Bytes)" << std::endl;
 
   return std::make_tuple(body, filename);
 
